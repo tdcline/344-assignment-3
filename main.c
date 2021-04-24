@@ -7,19 +7,24 @@
 // Maximum command line length is 2048 characters
 // Need two additional for \n that getline() adds and \0 
 #define MAX_COMMAND_SIZE 2050
+#define MAX_ARGS 512
 
 /* Create struct for elements of command line */
 struct userCommand {
-  char* command = NULL;
-  char* args = NULL;
-  char* inputFile;
-  char* outputFile;
+  char* command;
+  char* args[MAX_ARGS];
+  int numArgs;
+  char* redirects[4];
+  int numRedirects;
   bool background;
 };
 
+/* Displays the ': ' characters to the terminal, creating the frontend 
+   for the shell */
 int displayLine(void) {
   printf(": ");
   fflush(stdout);
+  
   return 0;
 }
 
@@ -46,7 +51,6 @@ char* getCommand(void) {
   return newCommand;
 }
 
-
 /* Test the a command line entry for blank line or commented line. Returns true if 
    the command is a blank line or begins with a '#' */
 bool skipTest(char* commandLine) {
@@ -66,12 +70,58 @@ bool skipTest(char* commandLine) {
 }
 
 /* Parse command */
-int parseCommand(char* commandLine) {
+struct userCommand *parseCommand(char* commandLine) {
+  
+  char* saveptr;
+  int numArgs = 0;
+  int numRedirects = 0;
+  char* inputR = "<";
+  char* outputR = ">";
+  char* background = " &";
+  bool redirectReached = false;
+
+  struct userCommand *newCommand = malloc(sizeof(struct userCommand));
 
   
+  // Check for background first
+  if(strcmp(commandLine + strlen(commandLine) - 2, background) == 0) {
+    newCommand->background = true;
+  } else {
+    newCommand->background = false;
+  }
 
+  // Process command
+  char* token = strtok_r(commandLine, " ", &saveptr);
+  newCommand->command = strdup(token);
+  
+  // Begin processing additional information
+  token = strtok_r(NULL, " ", &saveptr);
 
-  return 0;
+  while(token != NULL) {
+    // If redirect symbol reached, there are no more arguments
+    if(redirectReached || strcmp(token, inputR) == 0 || strcmp(token, outputR) == 0) {
+      // Ensure token is not the ampersand
+      if(strcmp(token, background + 1) != 0) {
+        redirectReached = true;
+        newCommand->redirects[numRedirects] = strdup(token);
+        numRedirects++;
+      }
+    // Otherwise, still loading arguments
+    } else {
+      if(strcmp(token, background + 1) != 0) {
+        newCommand->args[numArgs] = strdup(token);
+        numArgs++;
+      }
+    }
+    // Parse to next piece of information in the command
+    token = strtok_r(NULL, " ", &saveptr);
+  }
+
+  newCommand->numArgs = numArgs;
+  newCommand->numRedirects = numRedirects;
+
+  free(token);
+  return newCommand;
 }
 
 
@@ -80,26 +130,32 @@ int parseCommand(char* commandLine) {
 int main(void) {
   
   // allocate variables
-  char* userCommand;
+  char* newCommand;
+  struct userCommand *commandInfo;
   bool skip = false;
 
   // display new line
   displayLine();
 
   // get new command
-  userCommand = getCommand();
-  skip = skipTest(test);
+  newCommand = getCommand();
+  skip = skipTest(newCommand);
   if(skip != true) {
     // parse command elements
-    parseCommand(userCommand);
+    commandInfo = parseCommand(newCommand);
+    free(newCommand);
 
+    // testing
+    for(int i = 0; i < commandInfo->numRedirects; i++) {
+      printf("%s\n", commandInfo->redirects[i]);
+    }
   }
 
   // process/do command
 
   // cleanup each time
 
-  free(userCommand);
+  
   
   
   
