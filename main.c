@@ -6,6 +6,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 // Maximum command line length is 2048 characters
 // Need two additional for \n that getline() adds and \0 
@@ -15,6 +16,7 @@
 /* Create struct for elements of command line */
 struct userCommand {
   char* command;
+  // Add 2 to args array for initial command and NULL ending element
   char* args[MAX_ARGS];
   int numArgs;
   // redirects array holds up to 4 elements: the redirect symbols and their filenames
@@ -182,7 +184,7 @@ struct userCommand *parseCommand(char* commandLine) {
   // Process command
   char* token = strtok_r(commandLine, " ", &saveptr);
   newCommand->command = strdup(token);
-  
+
   // Begin processing additional information
   token = strtok_r(NULL, " ", &saveptr);
 
@@ -215,30 +217,251 @@ struct userCommand *parseCommand(char* commandLine) {
   return newCommand;
 }
 
+/* Redirect standard input to the inputFile argument. */
+int redirectInput(char* inputFile) {
+
+  // Open the new passed in file in read only mode
+  int sourceFd = open(inputFile, O_RDONLY);
+  if(sourceFd == -1) {
+    printf("Error opening source file.\n");
+    fflush(stdout);
+    exit(1);
+  }
+
+  // Redirect standard input to specified file
+  int result = dup2(sourceFd, 0);
+  if(result == -1) {
+    printf("Error redirecting standard input from file.\n");
+    fflush(stdout);
+    exit(1);
+  }
+
+  // Return success
+  return 0;
+}
+
+/* Redirect standard output to the outputFile argument. */
+int redirectOutput(char* outputFile) {
+
+  // Open the new target file for output in write only mode
+  int targetFd = open(outputFile, O_WRONLY | O_CREAT | O_TRUNC, 0777);
+  if(targetFd == -1) {
+    printf("Error open output file.\n");
+    fflush(stdout);
+    exit(1);
+  }
+
+  // Redirect standard output to the specified file
+  int result = dup2(targetFd, 1);
+  if(result == -1) {
+    printf("Error redirecting standard output to file.");
+    fflush(stdout);
+  }
+
+  fcntl(targetFd, F_SETFD, FD_CLOEXEC);
+
+  // Return success
+  return 0;
+}
+
+/* Changes the current directory to the one in HOME environment variable or to 
+   the path specified by the user if given. Takes a struct of the user's command 
+   information as an argument. */
+int changedir(struct userCommand *info) {
+
+  // Set up variables to change directory
+  char* desiredDir;
+  int success;
+  // Test vars:
+  // char* test;
+  // char testtwo[256];
+
+  // Check if the user passed in an argument with cd
+  if(info->numArgs == 0) {
+    // No path given means change to directory specified in HOME environment var
+    desiredDir = getenv("HOME");
+    success = chdir(desiredDir);
+  } else if(info->numArgs == 1) {
+    // Path given means change to specified path
+    success = chdir(info->args[0]);
+  } else {
+    printf("Error: too many arguments.\n");
+    fflush(stdout);
+  }
+  // Print error message if change was unsuccessful
+  if(success != 0) {
+    printf("\nError: chdir unsuccessful.\n");
+    fflush(stdout);
+  }
+  // Testing:
+  // test = getenv("PWD");
+  // printf("\nThe PWD getenv is %s\n", test);
+
+  // getcwd(testtwo, sizeof(testtwo));
+  // printf("\nThe CWD is %s\n", testtwo);
+
+  // Return to previous function
+  return 0;
+}
+
+
 /* Process Command */
-int processCommand(struct userCommand *info) {
+bool processCommand(struct userCommand *info, int* fgExit) {
 
   // Establish built-in commands
   char* changeDir = "cd";
   char* status = "status";
-  char* exit = "exit";
+  char* exitVar = "exit";
+  bool done = false;
 
   // Check for built-in commands first
   if(strcmp(info->command, changeDir) == 0) {
-    // CD function
+    // cd function
+    changedir(info);
   } else if(strcmp(info->command, status) == 0) {
     // Status function
-  } else if(strcmp(info->command, exit) == 0) {
-    // Exit function
+    printf("exit value %d\n", *fgExit);
+    fflush(stdout);
+  } else if(strcmp(info->command, exitVar) == 0) {
+    //set exit condition for loop in startShell()
+    done = true;
   } else {
     // Fork
-    // Exec()
-    
+        //fg vs bg foreground first - which waits
+    int childStatus;
+    pid_t childPid = fork();
+    // Error message for fork failure
+    if(childPid == -1) {
+      perror("fork() failed!");
+      fflush(stdout);
+      exit(1);
+    } else if(childPid == 0) {
+      // CHILD PROCESS - do exec here
+
+      printf("We're in the child process pid: %d\n", getpid());
+      fflush(stdout);
+
+      if(info->numRedirects > 0) {
+        char* greaterThan = ">";
+        bool outputFirst = strcmp(info->redirects[0], greaterThan) == 0; 
+        if(info->numRedirects == 2 && outputFirst) {
+          // redirect output
+          redirectOutput(info->redirects[1]);
+        } else if(info->numRedirects == 2) {
+          // redirect input
+          redirectInput(info->redirects[1]);
+        } else if(outputFirst){
+          // redirect output then input
+          redirectOutput(info->redirects[1]);
+          redirectInput(info->redirects[3]);
+        } else {
+          // redirect input then output
+          redirectInput(info->redirects[1]);
+          redirectOutput(info->redirects[3]);
+        }
+      }
+
+      printf("numArgs is %d\n", info->numArgs);
+
+      // Set up pass to execArgs
+      int toPass = info->numArgs + 2;
+      char* execArgs[toPass];
+
+      // Modify arguments for passing into execvp() by adding command as the 
+      // first element and NULL as the last element
+      for(int a = 0; a < toPass; a++) {
+        if(a == 0) {
+          execArgs[a] = info->command;
+        } else if(a == (toPass-1)) {
+          execArgs[a] = NULL;
+        } else {
+          execArgs[a] = info->args[a-1];
+        }
+      }
+
+      execvp(execArgs[0], execArgs);
+      // if exec fails
+      printf("Error: Exec() failed.");
+      fflush(stdout);
+      exit(1);
+
+    } else {
+      // PARENT PROCESS - wait for child if running in foreground
+      pid_t child;
+      fflush(stdout);
+
+      if(info->background == false) {
+        child = waitpid(childPid, &childStatus, 0);
+        if(WIFEXITED(childStatus)) {
+          printf("The child exited normally with status %d\n", WEXITSTATUS(childStatus));
+          *fgExit = WEXITSTATUS(childStatus);
+        } else {
+          printf("The child exited abnormally due to signal %d\n", WTERMSIG(childStatus));
+          *fgExit = WTERMSIG(childStatus);
+        }
+      } else {
+        printf("background coming up");
+      }
+    }
   }
 
+  return done;
+}
 
+/* Takes a userCommand struct as an argument and deallocates the memory of its 
+   variables and the struct. */
+int freeCommandStruct(struct userCommand *info) {
 
+  // Free command
+  free(info->command);
 
+  // Free args
+  for(int i = 0; i < info->numArgs; i++) {
+    free(info->args[i]);
+  }
+  
+  // Free redirects
+  for(int m = 0; m < info->numRedirects; m++) {
+    free(info->redirects[m]);
+  }
+
+  // Free the struct
+  free(info);
+
+  return 0;
+}
+
+int startShell(void) {
+
+  // Set up variables for getting and processing commands
+  char* newCommand;
+  struct userCommand *commandInfo;
+  int lastFgExit = 0;
+  bool skip = false;
+  bool exit = false;
+  
+  // Loop to stay in shell
+  while(exit != true) {
+    // Display new line and get new command
+    displayLine();
+    newCommand = getCommand();
+    // Check for blank line or comment line
+    skip = skipTest(newCommand);
+    
+    if(skip != true) {
+      // Parse command elements into struct
+      commandInfo = parseCommand(newCommand);
+      // Free original command line
+      free(newCommand);
+      // Process command
+      exit = processCommand(commandInfo, &lastFgExit);
+    }
+
+    //free struct
+    freeCommandStruct(commandInfo);
+  }
+
+  // End shell
   return 0;
 }
 
@@ -246,40 +469,14 @@ int processCommand(struct userCommand *info) {
 
 
 
-
-
 /* Main function */
 int main(void) {
-  
-  // Set up variables for getting command info from user
-  char* newCommand;
-  struct userCommand *commandInfo;
-  bool skip = false;
 
-  // Display new line
-  displayLine();
 
-  // Get new command from user
-  newCommand = getCommand();
-  // Check if blank line or comment line
-  skip = skipTest(newCommand);
-  if(skip != true) {
-    // Parse command elements into struct
-    commandInfo = parseCommand(newCommand);
-    free(newCommand);
+  startShell();
+  // at exit: kill existing processes
 
-    // Process command
-    processCommand(commandInfo);
 
-  }
-
-  // process/do command
-
-  // cleanup each time
-
-  
-  
-  
   
 
   return EXIT_SUCCESS;
