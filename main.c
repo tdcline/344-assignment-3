@@ -7,11 +7,15 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <signal.h>
 
 // Maximum command line length is 2048 characters
 // Need two additional for \n that getline() adds and \0 
 #define MAX_COMMAND_SIZE 2050
 #define MAX_ARGS 512
+
+// Global variable for foreground only mode
+int foregroundOnly = 0;
 
 /* Create struct for elements of command line */
 struct userCommand {
@@ -23,6 +27,13 @@ struct userCommand {
   char* redirects[4];
   int numRedirects;
   bool background;
+};
+
+/* Create struct to store the exit status or signal code of the last 
+   foreground process. */
+struct lastStatus {
+  int code;
+  bool signal;
 };
 
 /* Displays the ': ' characters to the terminal, creating the frontend 
@@ -120,12 +131,11 @@ char* getCommand(void) {
   // Allocate variables for reading the user input
   char* newCommand = malloc(sizeof(MAX_COMMAND_SIZE));
   size_t len = 0;
-  ssize_t numRead;
   char* finalForm;
 
   // Referenced getline() man page
   // Read the user's command line entry into the memory pointed to with newCommand
-  numRead = getline(&newCommand, &len, stdin);
+  getline(&newCommand, &len, stdin);
 
   // getline() adds the newline character to the end of the string
   // Replace it with null-termination for non-blank lines since we don't need it
@@ -144,13 +154,11 @@ char* getCommand(void) {
    the command is a blank line or begins with a '#' */
 bool skipTest(char* commandLine) {
 
-  // Define variables to test against
+  // Define skip condition
   bool skipIt = false;
-  char blankCheck = '\n';
-  char commentCheck = '#';
-  
-  // Since getline() keeps the \n for a blank line, test for blank line by comparing against \n
-  if(blankCheck == commandLine[0] || commentCheck == commandLine[0]) {
+
+  // Check for 
+  if(commandLine[0] == '#' || commandLine[0] == '\n') {
     skipIt = true;
   }
 
@@ -175,7 +183,7 @@ struct userCommand *parseCommand(char* commandLine) {
   struct userCommand *newCommand = malloc(sizeof(struct userCommand));
 
   // Check for background character first
-  if(strcmp(commandLine + strlen(commandLine) - 2, background) == 0) {
+  if((strcmp(commandLine + strlen(commandLine) - 2, background) == 0) && foregroundOnly == 0) {
     newCommand->background = true;
   } else {
     newCommand->background = false;
@@ -211,7 +219,6 @@ struct userCommand *parseCommand(char* commandLine) {
   // Store number of arguments and redirects for later use
   newCommand->numArgs = numArgs;
   newCommand->numRedirects = numRedirects;
-
   // Free the token pointer and return the build struct
   free(token);
   return newCommand;
@@ -246,7 +253,7 @@ int redirectOutput(char* outputFile) {
   // Open the new target file for output in write only mode
   int targetFd = open(outputFile, O_WRONLY | O_CREAT | O_TRUNC, 0777);
   if(targetFd == -1) {
-    printf("Error open output file.\n");
+    printf("Error opening output file.\n");
     fflush(stdout);
     exit(1);
   }
@@ -258,10 +265,37 @@ int redirectOutput(char* outputFile) {
     fflush(stdout);
   }
 
-  fcntl(targetFd, F_SETFD, FD_CLOEXEC);
+  // fcntl(targetFd, F_SETFD, FD_CLOEXEC);
 
   // Return success
   return 0;
+}
+
+/* Checks for any terminated background processes. Displays message regarding 
+   terminated process and termination code or exit value. */
+int checkBg(void) {
+
+  // Set up variables to wait on pids
+  pid_t childPid;
+  int childStatus;
+
+  // Loop unitl waitpid returns a 0 marking no recent child process terminations
+  // Concept of using waitpid with -1 and WNOHANG referenced from Exploration: Process API 
+  // - Monitoring Child Processes Interpreting the Termination Status example with added loop. 
+  while((childPid = waitpid(-1, &childStatus, WNOHANG)) > 0) {
+    // Display message regarding ending process
+    printf("background pid %d is done: ", childPid);
+
+    // Continue message with exit status or termination code
+    if(WIFEXITED(childStatus)) {
+      printf("exit value %d\n", WEXITSTATUS(childStatus));
+    } else {
+      printf("terminated by signal %d\n", WTERMSIG(childStatus));
+    }
+    fflush(stdout);
+  }
+
+  return 0;  
 }
 
 /* Changes the current directory to the one in HOME environment variable or to 
@@ -293,22 +327,32 @@ int changedir(struct userCommand *info) {
     printf("\nError: chdir unsuccessful.\n");
     fflush(stdout);
   }
-  // Testing:
-  // test = getenv("PWD");
-  // printf("\nThe PWD getenv is %s\n", test);
-
-  // getcwd(testtwo, sizeof(testtwo));
-  // printf("\nThe CWD is %s\n", testtwo);
 
   // Return to previous function
   return 0;
 }
 
+/* Displays the exit status code or termination signal code of the last 
+   foreground process terminated. */
+int statusDisplay(struct lastStatus *status) {
 
-/* Process Command */
-bool processCommand(struct userCommand *info, int* fgExit) {
+  // Check whether signal or exit code
+  if(status->signal == true) {
+    printf("terminated by signal %d\n", status->code);
+  } else {
+    printf("exit value %d\n", status->code);
+  }
+  fflush(stdout);
+  
+  return 0;
+}
 
-  // Establish built-in commands
+/* Processes and executes the user's command. Implements built-in commands from 
+   the shell and all other foreground or background commands with an exec() 
+   function. */
+bool processCommand(struct userCommand *info, struct lastStatus *exitStatus, struct sigaction ignoreInt, struct sigaction handleTSTP) {
+
+  // Establish vars for built-in commands and exit condition
   char* changeDir = "cd";
   char* status = "status";
   char* exitVar = "exit";
@@ -320,49 +364,74 @@ bool processCommand(struct userCommand *info, int* fgExit) {
     changedir(info);
   } else if(strcmp(info->command, status) == 0) {
     // Status function
-    printf("exit value %d\n", *fgExit);
-    fflush(stdout);
+    statusDisplay(exitStatus);
   } else if(strcmp(info->command, exitVar) == 0) {
-    //set exit condition for loop in startShell()
+    // Set exit condition for loop in startShell()
     done = true;
   } else {
-    // Fork
-        //fg vs bg foreground first - which waits
+    // Fork to run exec() in child process
     int childStatus;
     pid_t childPid = fork();
+
     // Error message for fork failure
     if(childPid == -1) {
-      perror("fork() failed!");
+      perror("fork() failed!\n");
       fflush(stdout);
       exit(1);
     } else if(childPid == 0) {
-      // CHILD PROCESS - do exec here
+      // CHILD PROCESS
+      // Set to ignore STSP
+      handleTSTP.sa_handler = SIG_IGN;
+      sigaction(SIGTSTP, &handleTSTP, NULL);
+      
+      // Restore SIGINT for FG
+      if(info->background != true) {
+        ignoreInt.sa_handler = SIG_DFL;
+        sigaction(SIGINT, &ignoreInt, NULL);
+      }
 
-      printf("We're in the child process pid: %d\n", getpid());
-      fflush(stdout);
+      // Ran out of time to clean up and test. In between the lines is redirecting
+      // standard input and output. Would put into separate function with more time.
+      // --------------------------------------------------------------------
+      // Allocate a string for /dev/null background commands
+      char* tempString = "/dev/null";
+      char* devNull = strdup(tempString);
 
+      // Redirect standard in or standard out if needed
       if(info->numRedirects > 0) {
         char* greaterThan = ">";
         bool outputFirst = strcmp(info->redirects[0], greaterThan) == 0; 
+
         if(info->numRedirects == 2 && outputFirst) {
-          // redirect output
+          // Redirect output only
           redirectOutput(info->redirects[1]);
+          if(info->background == true){
+            redirectInput(devNull);
+          }
         } else if(info->numRedirects == 2) {
-          // redirect input
+          // Redirect input only 
           redirectInput(info->redirects[1]);
+          if(info->background == true){
+            redirectOutput(devNull);
+          }
         } else if(outputFirst){
-          // redirect output then input
+          // Redirect output then input
           redirectOutput(info->redirects[1]);
           redirectInput(info->redirects[3]);
         } else {
-          // redirect input then output
+          // Redirect input then output
           redirectInput(info->redirects[1]);
           redirectOutput(info->redirects[3]);
         }
+      } else if(info->background == true) {
+        redirectInput(devNull);
+        redirectOutput(devNull);
       }
-
-      printf("numArgs is %d\n", info->numArgs);
-
+      
+      // Free devNull pointer that was created with strdup()
+      free(devNull);
+      // --------------------------------------------------------------------
+      
       // Set up pass to execArgs
       int toPass = info->numArgs + 2;
       char* execArgs[toPass];
@@ -379,32 +448,42 @@ bool processCommand(struct userCommand *info, int* fgExit) {
         }
       }
 
+      // Run command through execvp
       execvp(execArgs[0], execArgs);
+      
       // if exec fails
-      printf("Error: Exec() failed.");
+      printf("Error: exec() failed to run that command.\n");
       fflush(stdout);
       exit(1);
 
     } else {
-      // PARENT PROCESS - wait for child if running in foreground
-      pid_t child;
+      // PARENT PROCESS
+      // Wait for child if running in foreground
       fflush(stdout);
-
+      // Foreground command
       if(info->background == false) {
-        child = waitpid(childPid, &childStatus, 0);
+        // Wait for child to finish since foreground command
+        waitpid(childPid, &childStatus, 0);
+        // Document exit status or signal code
         if(WIFEXITED(childStatus)) {
-          printf("The child exited normally with status %d\n", WEXITSTATUS(childStatus));
-          *fgExit = WEXITSTATUS(childStatus);
+          exitStatus->signal = false;
+          exitStatus->code = WEXITSTATUS(childStatus);
         } else {
-          printf("The child exited abnormally due to signal %d\n", WTERMSIG(childStatus));
-          *fgExit = WTERMSIG(childStatus);
+          exitStatus->signal = true;
+          exitStatus->code = WTERMSIG(childStatus);
+          // If killed by a signal - display signal number
+          printf("terminated by signal %d\n", exitStatus->code);
+          fflush(stdout);
         }
+      // Background command
       } else {
-        printf("background coming up");
+        // Display message for starting background command
+        printf("The background pid is %d\n", childPid);
+        fflush(stdout);
       }
+      checkBg();
     }
   }
-
   return done;
 }
 
@@ -431,53 +510,88 @@ int freeCommandStruct(struct userCommand *info) {
   return 0;
 }
 
+/* Handler function that ignores the SIGTSTP signal and toggles in or out 
+   of foreground-only mode. */ 
+void catchSIGTSTP(int signo) {
+
+  // Set up initial variable to hold message to display
+  char* message;
+
+  // Toggle global variable keeping track of foreground only mode
+  // Display appropriate message
+  if(foregroundOnly == 0) {
+    // Toggle into foreground-only mode
+    message = "\nEntering foreground-only mode (& is now ignored)\n: ";
+    write(STDOUT_FILENO, message, 52);
+    foregroundOnly = 1;
+  } else {
+    // Toggle out of foreground-only mode
+    message = "\nExiting foreground-only mode\n: ";
+    write(STDOUT_FILENO, message, 32);
+    foregroundOnly = 0;
+  }
+}
+
+/* Starts the program putting the user into the shell. */
 int startShell(void) {
 
   // Set up variables for getting and processing commands
   char* newCommand;
   struct userCommand *commandInfo;
-  int lastFgExit = 0;
   bool skip = false;
   bool exit = false;
+
+  // Set up sigaction structs for SIGINT and SIGTSTP
+  struct sigaction SIGINT_ignore = {{0}};
+  struct sigaction SIGTSTP_handle = {{0}};
   
+  // Ignore SIGINT and handle SIGTSTP with catchTSTP function
+  SIGINT_ignore.sa_handler = SIG_IGN;
+  SIGTSTP_handle.sa_handler = catchSIGTSTP;
+  SIGTSTP_handle.sa_flags = SA_RESTART;
+
+  // Initialize signal handlers
+  sigaction(SIGINT, &SIGINT_ignore, NULL);
+  sigaction(SIGTSTP,  &SIGTSTP_handle, NULL);
+
+  // Initialize status struct members
+  struct lastStatus *status = malloc(sizeof(struct lastStatus));
+  status->code = 0;
+  status->signal = false;
+
   // Loop to stay in shell
   while(exit != true) {
     // Display new line and get new command
     displayLine();
     newCommand = getCommand();
+
     // Check for blank line or comment line
     skip = skipTest(newCommand);
     
     if(skip != true) {
       // Parse command elements into struct
       commandInfo = parseCommand(newCommand);
-      // Free original command line
-      free(newCommand);
+
       // Process command
-      exit = processCommand(commandInfo, &lastFgExit);
+      exit = processCommand(commandInfo, status, SIGINT_ignore, SIGTSTP_handle);
+      freeCommandStruct(commandInfo);
     }
-
-    //free struct
-    freeCommandStruct(commandInfo);
+    // Free pointer and check for terminated background processes
+    free(newCommand);
+    checkBg();
   }
-
+  // Free pointer for storing status
+  free(status);
   // End shell
   return 0;
 }
 
-
-
-
-
 /* Main function */
 int main(void) {
 
-
+  // Start the shell
   startShell();
-  // at exit: kill existing processes
 
-
-  
-
+  // Exit the program
   return EXIT_SUCCESS;
 }
